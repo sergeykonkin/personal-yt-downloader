@@ -22,6 +22,18 @@ document holds everything an agent needs to work on the repo.
   `/data` in the container, or wherever `-data` points): per video
   `videos/<id>/metadata.json` and
   `videos/<id>/video.mp4`, plus `sessions.json` and `links.json`.
+- `shortcuts/` — source of the iOS Shortcut (`Download-YouTube-Video.plist`,
+  Share Sheet name "Download YouTube video"): takes a URL from the Share
+  Sheet or an ask prompt, POSTs it to `/api/jobs` with the Bearer token,
+  notifies, and finishes — no polling or downloading (two import questions:
+  API origin and token). `make shortcut` (macOS only) lints and signs an
+  importable build into `shortcuts/build/`; the plist is the committed
+  source of truth, the signed build is gitignored.
+- `skills/` — agent skills shared by every tool: `.claude/skills` and
+  `.agents/skills` are symlinks to this one directory, so Claude Code and
+  other agents discover the same skills. Holds
+  `download-youtube-video-shortcut/` (editing rules and the plist-wiring
+  reference for the Shortcut).
 
 ## Configuration
 

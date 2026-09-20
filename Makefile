@@ -1,9 +1,10 @@
-.PHONY: help web-npm-install web-build embed go-build go-test web-test test build run-dev docker-build clean
+.PHONY: help web-npm-install web-build embed go-build go-test web-test test build shortcut run-dev docker-build clean
 
 help:
 	@echo "Targets:"
 	@echo "  build         Build the web UI, embed it, and compile the server to bin/server"
 	@echo "  test          Run the Go test suite (race) and the web test suite"
+	@echo "  shortcut      Lint and sign the iOS Shortcut into shortcuts/build/ (macOS)"
 	@echo "  docker-build  Build the local dev image (personal-yt-downloader)"
 	@echo "  run-dev       Build the dev image, then run it on :8080 (http, dev cookies)"
 	@echo "  clean         Remove build outputs and the local data directory"
@@ -35,6 +36,21 @@ test: go-test web-test
 
 build: go-build
 
+# Lint the Shortcut plist and sign it into an importable .shortcut. The
+# native signer only accepts plist input through a .shortcut extension, so
+# the source is copied under a temporary name and removed after signing.
+# macOS only (Apple's shortcuts CLI); the signed build is a gitignored
+# artifact — the plist is the committed source of truth.
+shortcut:
+	plutil -lint shortcuts/Download-YouTube-Video.plist
+	mkdir -p shortcuts/build
+	cp shortcuts/Download-YouTube-Video.plist shortcuts/build/Download-YouTube-Video-unsigned.shortcut
+	shortcuts sign \
+		--mode anyone \
+		--input shortcuts/build/Download-YouTube-Video-unsigned.shortcut \
+		--output "shortcuts/build/Download YouTube video.shortcut"
+	rm shortcuts/build/Download-YouTube-Video-unsigned.shortcut
+
 docker-build:
 	docker build -t personal-yt-downloader .
 
@@ -51,4 +67,4 @@ run-dev: docker-build
 		personal-yt-downloader -insecure-cookies
 
 clean:
-	rm -rf bin web/dist data
+	rm -rf bin web/dist shortcuts/build data

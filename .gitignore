@@ -6,3 +6,5 @@ data/
 .old/
 *.log
 .DS_Store
+*.shortcut
+shortcuts/build/
