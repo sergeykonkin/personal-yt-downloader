@@ -1,0 +1,181 @@
+name: Release
+
+on:
+  # The glob is a cheap pre-filter only — it cannot express "exactly three
+  # numeric segments" (v*.*.* still matches v1.2.3.4 or v1.2.3-rc.1). The
+  # validate job below enforces strict vX.Y.Z and stops anything else
+  # before any test, build, or publish runs.
+  push:
+    tags: ['v*.*.*']
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  # GHCR requires a lowercase image name; sergeykonkin/personal-yt-downloader
+  # already is. If the repo is ever renamed to something with capitals,
+  # lowercase it here.
+  IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  # 1. Tag gate: strict semver (vX.Y.Z) only. Anything that slips past the
+  # trigger glob fails here in seconds — no tests, no builds, nothing pushed.
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Verify the tag is strict semver (vX.Y.Z)
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          # Official semver grammar (no leading zeros, no prerelease/build
+          # suffixes) — exactly the forms metadata-action can derive tags from.
+          re='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+          if ! [[ "$tag" =~ $re ]]; then
+            echo "::error::Tag '${tag}' is not vX.Y.Z; the release accepts strict semver tags only."
+            exit 1
+          fi
+
+  # 2. Gate: the full test suite, run on the exact tag being released.
+  test:
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install web dependencies
+        working-directory: web
+        run: npm ci
+
+      - name: Run full test chain
+        run: make test
+
+  # 3. Native per-arch builds. Each matrix leg builds its own platform on a
+  # matching runner (no QEMU) and pushes to the registry anonymously by
+  # digest — no arch-specific tags are ever visible in the package.
+  build:
+    needs: test
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm # free arm runner for public repos
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    steps:
+      - name: Prepare platform pair (artifact names cannot contain "/")
+        run: |
+          platform="${{ matrix.platform }}"
+          echo "PLATFORM_PAIR=${platform//\//-}" >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: . # the web UI and the Go binary build inside the Dockerfile
+          platforms: ${{ matrix.platform }}
+          provenance: false # keeps the merged index free of unknown/unknown entries
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: Export digest
+        run: |
+          mkdir -p "${{ runner.temp }}/digests"
+          digest="${{ steps.build.outputs.digest }}"
+          touch "${{ runner.temp }}/digests/${digest#sha256:}"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: digests-${{ env.PLATFORM_PAIR }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # 4. Assemble the per-arch manifests into one multi-arch index and push it
+  # with the final tags (v1.2.3 -> 1.2.3, v1.2.3, latest).
+  merge:
+    needs: build
+    permissions:
+      contents: read
+      packages: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v8
+        with:
+          pattern: digests-*
+          path: ${{ runner.temp }}/digests
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Semver rules for the final tags (v1.0.0 -> 1.0.0 and v1.0.0). No
+      # explicit latest rule: the default latest=auto flavor adds :latest to
+      # stable semver tags, and the validate gate guarantees every accepted
+      # tag is stable. Keep comments out of the tags value — the block scalar
+      # is passed verbatim and metadata-action treats # as pattern text.
+      - name: Docker meta (derive the final tags from the git tag)
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{raw}}
+
+      - name: Create manifest list and push
+        working-directory: ${{ runner.temp }}/digests
+        run: |
+          # The downloaded files are named after the per-arch digests; each
+          # becomes an IMAGE@sha256:<digest> source, each metadata tag a -t
+          # flag. Plain arrays — no printf format reuse, no word splitting.
+          tag_flags=()
+          while IFS= read -r t; do
+            if [[ -n "$t" ]]; then tag_flags+=("-t" "$t"); fi
+          done <<< "$DOCKER_METADATA_OUTPUT_TAGS"
+          sources=()
+          for digest in *; do
+            sources+=("${IMAGE}@sha256:${digest}")
+          done
+          docker buildx imagetools create "${tag_flags[@]}" "${sources[@]}"
+
+      - name: Inspect pushed image
+        run: |
+          docker buildx imagetools inspect "${IMAGE}:${{ steps.meta.outputs.version }}"

@@ -1,0 +1,42 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod # "go 1.27" -> latest 1.27.x
+          cache: true # module cache, keyed on go.sum
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22 # matches node:22-alpine in the Dockerfile
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      # npm ci before make test: the npm install inside the Makefile
+      # becomes a no-op afterwards, and lockfile drift fails fast here.
+      - name: Install web dependencies
+        working-directory: web
+        run: npm ci
+
+      - name: Run full test chain (embed -> vet/race -> vitest)
+        run: make test

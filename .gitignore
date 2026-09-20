@@ -1,0 +1,8 @@
+web/node_modules/
+web/dist/
+internal/app/web/dist/
+bin/
+data/
+.old/
+*.log
+.DS_Store

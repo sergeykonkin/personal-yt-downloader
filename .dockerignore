@@ -1,0 +1,11 @@
+# The docker build context is the repository root.
+.git
+.old
+data
+bin
+web/node_modules
+web/dist
+# Only the dist built inside the image is embedded; never the host copy.
+internal/app/web/dist
+*.log
+.DS_Store
