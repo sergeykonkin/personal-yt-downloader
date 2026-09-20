@@ -16,8 +16,11 @@ make run-dev   # build the dev image, serve on http://localhost:8080
 ```
 
 Password is `local` (override by exporting `PASSWORD` before `make
-run-dev`). The container (Ctrl-C stops it) publishes port 8080, keeps
-downloads under `./data`, and uses plain-HTTP dev cookies.
+run-dev`). Optionally export `API_TOKEN` as well to accept
+`Authorization: Bearer <token>` for direct API requests (curl, iOS
+Shortcuts) against the `/api/jobs*` endpoints — unset means off. The
+container (Ctrl-C stops it) publishes port 8080, keeps downloads under
+`./data`, and uses plain-HTTP dev cookies.
 
 Working on the code itself needs Go 1.27 and Node.js on the host:
 `make test` runs the Go suite (race detector) plus vitest, and `make build`

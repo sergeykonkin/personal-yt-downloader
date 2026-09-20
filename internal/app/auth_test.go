@@ -3,6 +3,7 @@ package app
 import (
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 )
@@ -45,7 +46,7 @@ func TestVerifyPasswordRejectsMalformedHashes(t *testing.T) {
 }
 
 func TestAuthVerifiesEnvPassword(t *testing.T) {
-	a := NewAuth("first-password")
+	a := NewAuth("first-password", "")
 	if !a.Verify("first-password") {
 		t.Fatal("configured password rejected")
 	}
@@ -61,15 +62,38 @@ func TestAuthVerifiesEnvPassword(t *testing.T) {
 	// Each boot derives a fresh salt for the login hash, but the fingerprint
 	// must be stable for a given password so a restart under the same
 	// password keeps sessions.
-	b := NewAuth("first-password")
+	b := NewAuth("first-password", "")
 	if a.Verify("first-password") && !b.Verify("first-password") {
 		t.Error("second instance rejects the same password")
 	}
 	if a.Fingerprint() != b.Fingerprint() {
 		t.Error("fingerprint differs between boots under the same password")
 	}
-	if c := NewAuth("another-password"); c.Fingerprint() == a.Fingerprint() {
+	if c := NewAuth("another-password", ""); c.Fingerprint() == a.Fingerprint() {
 		t.Error("different passwords share a fingerprint")
+	}
+}
+
+func TestAuthVerifiesAPIToken(t *testing.T) {
+	a := NewAuth("first-password", "shortcut-token")
+	if !a.VerifyAPIToken("shortcut-token") {
+		t.Fatal("configured API token rejected")
+	}
+	if a.VerifyAPIToken("Shortcut-Token") {
+		t.Error("API token comparison is not exact")
+	}
+	if a.VerifyAPIToken("") {
+		t.Error("empty API token accepted")
+	}
+	// The token is held as its SHA-256 digest, never as plaintext.
+	if a.apiTokenHash != hashToken("shortcut-token") {
+		t.Error("API token not stored as its SHA-256 digest")
+	}
+	// Without a configured token nothing is accepted — not even the value
+	// another deployment might run with.
+	off := NewAuth("first-password", "")
+	if off.VerifyAPIToken("shortcut-token") || off.VerifyAPIToken("") {
+		t.Error("API token verified while bearer auth is disabled")
 	}
 }
 
@@ -78,14 +102,14 @@ func TestSessionLoadDropsSessionsOnPasswordChange(t *testing.T) {
 	clk := newClock(time.Unix(1700000000, 0))
 	path := filepath.Join(dir, "sessions.json")
 
-	first := NewSessionStore(path, NewAuth("first-password").Fingerprint(), clk.Now)
+	first := NewSessionStore(path, NewAuth("first-password", "").Fingerprint(), clk.Now)
 	token, _, _, err := first.Create()
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	// A restart under the same password keeps the session.
-	same := NewSessionStore(path, NewAuth("first-password").Fingerprint(), clk.Now)
+	same := NewSessionStore(path, NewAuth("first-password", "").Fingerprint(), clk.Now)
 	if err := same.Load(); err != nil {
 		t.Fatal(err)
 	}
@@ -94,7 +118,7 @@ func TestSessionLoadDropsSessionsOnPasswordChange(t *testing.T) {
 	}
 
 	// A restart under a changed password (a different fingerprint) drops it.
-	changed := NewSessionStore(path, NewAuth("second-password").Fingerprint(), clk.Now)
+	changed := NewSessionStore(path, NewAuth("second-password", "").Fingerprint(), clk.Now)
 	if err := changed.Load(); err != nil {
 		t.Fatal(err)
 	}
@@ -234,46 +258,97 @@ func TestSessionStorePersistAcrossReload(t *testing.T) {
 	}
 }
 
-func TestRateLimiter(t *testing.T) {
+func TestRateLimiterAttempt(t *testing.T) {
 	clk := newClock(time.Unix(1700000000, 0))
 	limiter := NewRateLimiter(15*time.Minute, 5, 30, clk.Now)
-	// Five failures block the sixth attempt.
+	// Five failures go through, each reported as allowed but unverified.
 	for i := 0; i < 5; i++ {
-		if ok, _ := limiter.Allowed("1.2.3.4"); !ok {
-			t.Fatalf("attempt %d blocked too early", i+1)
+		allowed, verified, _ := limiter.Attempt("1.2.3.4", func() bool { return false }, false)
+		if !allowed || verified {
+			t.Fatalf("failure %d: allowed=%v verified=%v", i+1, allowed, verified)
 		}
-		limiter.RecordBad("1.2.3.4")
 	}
-	ok, wait := limiter.Allowed("1.2.3.4")
-	if ok {
+	// The sixth is denied — and its credential is never examined.
+	invoked := false
+	allowed, _, wait := limiter.Attempt("1.2.3.4", func() bool { invoked = true; return true }, false)
+	if allowed {
 		t.Fatal("blocked after five failures")
+	}
+	if invoked {
+		t.Error("blocked attempt examined the credential")
 	}
 	if wait <= 0 {
 		t.Fatal("wait must be positive while the window is active")
 	}
-	// Other clients are unaffected.
-	if ok, _ := limiter.Allowed("5.6.7.8"); !ok {
+	// A denial records nothing: the five failures stand alone.
+	if n := len(limiter.attempts["1.2.3.4"]); n != 5 {
+		t.Errorf("denied attempt left %d entries; want 5", n)
+	}
+	// Other clients are unaffected, and their successful attempts record
+	// nothing (a polling client never burns the budget).
+	if allowed, verified, _ := limiter.Attempt("5.6.7.8", func() bool { return true }, false); !allowed || !verified {
 		t.Fatal("unrelated client blocked")
 	}
-	// After the window passes, attempts are allowed again.
+	if n := len(limiter.attempts["5.6.7.8"]); n != 0 {
+		t.Errorf("successful attempt recorded %d entries", n)
+	}
+	// After the window passes, attempts are allowed again — the entry
+	// check prunes the expired failures on its own.
 	clk.Advance(16 * time.Minute)
-	if ok, _ := limiter.Allowed("1.2.3.4"); !ok {
+	allowed, _, _ = limiter.Attempt("1.2.3.4", func() bool { return false }, false)
+	if !allowed {
 		t.Fatal("still blocked after the window expired")
 	}
 }
 
-func TestRateLimiterCapsTotalAttempts(t *testing.T) {
+func TestRateLimiterAttemptCountsSuccesses(t *testing.T) {
 	clk := newClock(time.Unix(1700000000, 0))
 	limiter := NewRateLimiter(15*time.Minute, 5, 30, clk.Now)
-	// 30 successful attempts (no failures) still eventually exhaust the cap.
-	for i := 0; i < 29; i++ {
-		if ok, _ := limiter.Allowed("9.9.9.9"); !ok {
-			t.Fatalf("attempt %d blocked too early", i+1)
+	// Login-style attempts count successes toward the total cap: thirty
+	// minted sessions fit in a window; the thirty-first is denied.
+	succeed := func() bool { return true }
+	for i := 0; i < 30; i++ {
+		allowed, verified, _ := limiter.Attempt("9.9.9.9", succeed, true)
+		if !allowed || !verified {
+			t.Fatalf("attempt %d denied too early", i+1)
 		}
 		clk.Advance(time.Second)
 	}
-	if ok, _ := limiter.Allowed("9.9.9.9"); ok {
+	allowed, _, wait := limiter.Attempt("9.9.9.9", succeed, true)
+	if allowed {
 		t.Fatal("attempt cap not enforced")
+	}
+	if wait <= 0 {
+		t.Fatal("wait must be positive while the window is active")
+	}
+}
+
+// Nine concurrent failures against a five-failure limit: the check, the
+// verification, and the recording are one lock-held operation, so exactly
+// five draw through and the rest are denied, however the attempts
+// interleave.
+func TestRateLimiterAttemptAtomic(t *testing.T) {
+	limiter := NewRateLimiter(15*time.Minute, 5, 30, nil)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	allowedCount, deniedCount := 0, 0
+	for i := 0; i < 9; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			allowed, _, _ := limiter.Attempt("1.2.3.4", func() bool { return false }, false)
+			mu.Lock()
+			defer mu.Unlock()
+			if allowed {
+				allowedCount++
+			} else {
+				deniedCount++
+			}
+		}()
+	}
+	wg.Wait()
+	if allowedCount != 5 || deniedCount != 4 {
+		t.Errorf("got %d allowed and %d denied; want 5 and 4", allowedCount, deniedCount)
 	}
 }
 

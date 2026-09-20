@@ -40,12 +40,13 @@ docker-build:
 
 # Local development run in a container: the image bundles yt-dlp, ffmpeg,
 # and deno, so nothing beyond Docker is needed on the host. The login
-# password is `local` unless PASSWORD is set in the environment, ./data
-# holds the downloads, and cookies are marked insecure because plain
-# http://localhost is not a secure context. Ctrl-C stops the server
-# (graceful); --rm cleans up.
+# password is `local` unless PASSWORD is set in the environment; exporting
+# API_TOKEN (optional) enables Bearer auth for direct API requests, unset
+# or empty keeps it disabled. ./data holds the downloads, and cookies are
+# marked insecure because plain http://localhost is not a secure context.
+# Ctrl-C stops the server (graceful); --rm cleans up.
 run-dev: docker-build
-	docker run --rm -p 8080:8080 -e PASSWORD="$${PASSWORD:-local}" \
+	docker run --rm -p 8080:8080 -e PASSWORD="$${PASSWORD:-local}" -e API_TOKEN="$${API_TOKEN:-}" \
 		-v "$$(pwd)/data:/data" \
 		personal-yt-downloader -insecure-cookies
 

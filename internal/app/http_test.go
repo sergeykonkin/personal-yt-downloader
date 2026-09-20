@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"testing/fstest"
 	"time"
@@ -65,7 +66,7 @@ func newHTTPEnv(t *testing.T, dl Downloader, fetch MetadataFetcher) *httpEnv {
 		})
 	}
 	manager := newTestManager(store, dl, fetch)
-	auth := NewAuth(testPassword)
+	auth := NewAuth(testPassword, "")
 	sessions := NewSessionStore(filepath.Join(dir, "sessions.json"), auth.Fingerprint(), clk.Now)
 	links := NewLinkStore(filepath.Join(dir, "links.json"), clk.Now)
 	limiter := NewRateLimiter(time.Minute, 5, 30, clk.Now)
@@ -90,50 +91,50 @@ func newHTTPEnv(t *testing.T, dl Downloader, fetch MetadataFetcher) *httpEnv {
 	return e
 }
 
-// do issues a session-authenticated request with JSON body handling and the
-// CSRF header applied automatically.
-func (e *httpEnv) do(method, path string, body any) *http.Response {
-	e.t.Helper()
+// issue performs a request with an optional JSON body and extra headers
+// against any URL, using the given client.
+func issue(t *testing.T, client *http.Client, method, url string, body any, header map[string]string) *http.Response {
+	t.Helper()
 	var reader io.Reader
 	if body != nil {
 		data, err := json.Marshal(body)
 		if err != nil {
-			e.t.Fatal(err)
+			t.Fatal(err)
 		}
 		reader = bytes.NewReader(data)
 	}
-	req, err := http.NewRequest(method, e.ts.URL+path, reader)
+	req, err := http.NewRequest(method, url, reader)
 	if err != nil {
-		e.t.Fatal(err)
+		t.Fatal(err)
 	}
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	if e.csrf != "" && method != http.MethodGet && method != http.MethodHead {
-		req.Header.Set("X-CSRF-Token", e.csrf)
+	for k, v := range header {
+		req.Header.Set(k, v)
 	}
-	res, err := e.client.Do(req)
+	res, err := client.Do(req)
 	if err != nil {
-		e.t.Fatal(err)
+		t.Fatal(err)
 	}
 	return res
+}
+
+// do issues a session-authenticated request with JSON body handling and the
+// CSRF header applied automatically.
+func (e *httpEnv) do(method, path string, body any) *http.Response {
+	e.t.Helper()
+	header := map[string]string{}
+	if e.csrf != "" && method != http.MethodGet && method != http.MethodHead {
+		header[csrfHeader] = e.csrf
+	}
+	return issue(e.t, e.client, method, e.ts.URL+path, body, header)
 }
 
 // bare issues a request with no cookies — the share-link client.
 func (e *httpEnv) bare(method, path string, header map[string]string) *http.Response {
 	e.t.Helper()
-	req, err := http.NewRequest(method, e.ts.URL+path, nil)
-	if err != nil {
-		e.t.Fatal(err)
-	}
-	for k, v := range header {
-		req.Header.Set(k, v)
-	}
-	res, err := http.DefaultClient.Do(req)
-	if err != nil {
-		e.t.Fatal(err)
-	}
-	return res
+	return issue(e.t, http.DefaultClient, method, e.ts.URL+path, nil, header)
 }
 
 func drain(res *http.Response) {
@@ -328,6 +329,407 @@ func TestHTTPLoginRateLimit(t *testing.T) {
 	drain(res)
 	if res.StatusCode != http.StatusOK {
 		t.Errorf("login after window = %d", res.StatusCode)
+	}
+}
+
+// The same atomicity on the password path: six simultaneous wrong-password
+// logins against the five-failure limit draw exactly five 401s and one 429,
+// however the requests interleave.
+func TestHTTPLoginConcurrentAttempts(t *testing.T) {
+	e := newHTTPEnv(t, nil, nil)
+
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	unauthorized, throttled := 0, 0
+	for i := 0; i < 6; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			req, err := http.NewRequest("POST", e.ts.URL+"/api/login",
+				strings.NewReader(`{"password":"wrong"}`))
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			req.Header.Set("Content-Type", "application/json")
+			res, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			drain(res)
+			mu.Lock()
+			defer mu.Unlock()
+			switch res.StatusCode {
+			case http.StatusUnauthorized:
+				unauthorized++
+			case http.StatusTooManyRequests:
+				throttled++
+			default:
+				t.Errorf("concurrent login = %d", res.StatusCode)
+			}
+		}()
+	}
+	wg.Wait()
+	if unauthorized != 5 || throttled != 1 {
+		t.Errorf("concurrent logins: %d unauthorized and %d throttled; want 5 and 1", unauthorized, throttled)
+	}
+}
+
+// ---- bearer auth (direct API requests) ----
+
+const testAPIToken = "direct-api-token"
+
+// tokenServer returns a second server over the same fakes whose Auth accepts
+// the given API token — the deployment shape a direct API client faces.
+func (e *httpEnv) tokenServer(token string) *httptest.Server {
+	e.t.Helper()
+	auth := NewAuth(testPassword, token)
+	server := NewServer(e.manager, e.store, auth, e.sessions, e.links, e.limiter, true, defaultTrustedProxies(e.t), e.assets)
+	ts := httptest.NewServer(server.Handler())
+	e.t.Cleanup(func() { ts.Close() })
+	return ts
+}
+
+// doBearer issues a cookie-less request carrying an Authorization header —
+// what a direct API client (curl, iOS Shortcuts) sends.
+func doBearer(t *testing.T, ts *httptest.Server, method, path, authorization string, body any) *http.Response {
+	t.Helper()
+	return issue(t, http.DefaultClient, method, ts.URL+path, body, map[string]string{"Authorization": authorization})
+}
+
+func TestHTTPBearerFullAPIAccess(t *testing.T) {
+	e := newHTTPEnv(t, nil, nil)
+	ts := e.tokenServer(testAPIToken)
+	auth := "Bearer " + testAPIToken
+
+	// Submitting needs neither a cookie, nor a CSRF token, nor an Origin.
+	res := doBearer(t, ts, "POST", "/api/jobs", auth, map[string]string{"url": goodURL})
+	var out struct {
+		Job jobView `json:"job"`
+	}
+	if res.StatusCode != http.StatusAccepted {
+		body, _ := io.ReadAll(res.Body)
+		res.Body.Close()
+		t.Fatalf("submit with token = %d: %s", res.StatusCode, body)
+	}
+	decodeJSON(t, res, &out)
+	id := out.Job.ID
+
+	// A foreign Origin changes nothing on the token path: CSRF defenses
+	// guard cookie auth, and a cross-site page cannot attach the header.
+	req, _ := http.NewRequest("POST", ts.URL+"/api/jobs",
+		strings.NewReader(`{"url":"https://www.youtube.com/watch?v=`+videoID(1)+`"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", auth)
+	req.Header.Set("Origin", "https://evil.example")
+	evil, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	drain(evil)
+	if evil.StatusCode != http.StatusAccepted {
+		t.Errorf("bearer submit with foreign Origin = %d", evil.StatusCode)
+	}
+
+	// The whole lifecycle is reachable: poll to ready, fetch the file,
+	// mint a share link, and delete.
+	waitFor(t, "job to become ready", func() bool {
+		res := doBearer(t, ts, "GET", "/api/jobs/"+id, auth, nil)
+		if res.StatusCode != http.StatusOK {
+			drain(res)
+			return false
+		}
+		var got struct {
+			Job jobView `json:"job"`
+		}
+		decodeJSON(t, res, &got)
+		return got.Job.Status == StatusReady
+	})
+	e.store.setFile(id, makeVideo(64))
+
+	res = doBearer(t, ts, "GET", "/api/jobs/"+id+"/download", auth, nil)
+	body, _ := io.ReadAll(res.Body)
+	res.Body.Close()
+	if res.StatusCode != http.StatusOK || len(body) != 64 {
+		t.Errorf("download with token = %d (%d bytes)", res.StatusCode, len(body))
+	}
+
+	res = doBearer(t, ts, "POST", "/api/jobs/"+id+"/link", auth, nil)
+	var link struct {
+		URL string `json:"url"`
+	}
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("share link with token = %d", res.StatusCode)
+	}
+	decodeJSON(t, res, &link)
+	if link.URL == "" {
+		t.Error("no share link issued")
+	}
+
+	res = doBearer(t, ts, "DELETE", "/api/jobs/"+id, auth, nil)
+	drain(res)
+	if res.StatusCode != http.StatusOK {
+		t.Errorf("delete with token = %d", res.StatusCode)
+	}
+}
+
+func TestHTTPBearerRejectsBadTokens(t *testing.T) {
+	e := newHTTPEnv(t, nil, nil)
+	ts := e.tokenServer(testAPIToken)
+
+	// A wrong token is a 401 with the token-specific message.
+	res := doBearer(t, ts, "GET", "/api/jobs", "Bearer wrong-token", nil)
+	var out map[string]string
+	decodeJSON(t, res, &out)
+	if res.StatusCode != http.StatusUnauthorized || out["error"] != "Invalid API token." {
+		t.Errorf("wrong token = %d %v", res.StatusCode, out)
+	}
+
+	// The session endpoints stay cookie-only: the token grants the API,
+	// not session management.
+	res = doBearer(t, ts, "GET", "/api/session", "Bearer "+testAPIToken, nil)
+	drain(res)
+	if res.StatusCode != http.StatusUnauthorized {
+		t.Errorf("session endpoint with token = %d", res.StatusCode)
+	}
+
+	// Once a Bearer header is present it is the only credential tried:
+	// a bad token is a 401 even alongside a valid session. The test
+	// servers share the 127.0.0.1 cookie domain, so e.client's session
+	// cookie rides along on this request.
+	e.login()
+	req, _ := http.NewRequest("GET", ts.URL+"/api/jobs", nil)
+	req.Header.Set("Authorization", "Bearer wrong-token")
+	res, err := e.client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	drain(res)
+	if res.StatusCode != http.StatusUnauthorized {
+		t.Errorf("bad token with valid session = %d", res.StatusCode)
+	}
+
+	// Conversely, a valid token authenticates without the CSRF handshake —
+	// the cookie plays no role on the token path.
+	req, _ = http.NewRequest("POST", ts.URL+"/api/jobs",
+		strings.NewReader(`{"url":"https://www.youtube.com/watch?v=`+videoID(2)+`"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+testAPIToken)
+	res, err = e.client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	drain(res)
+	if res.StatusCode != http.StatusAccepted {
+		t.Errorf("token submit with session but no CSRF = %d", res.StatusCode)
+	}
+}
+
+func TestHTTPBearerRateLimited(t *testing.T) {
+	e := newHTTPEnv(t, nil, nil)
+	ts := e.tokenServer(testAPIToken)
+
+	// Five bad tokens block the sixth attempt — the same per-IP budget as
+	// failed logins.
+	for i := 0; i < 5; i++ {
+		res := doBearer(t, ts, "GET", "/api/jobs", "Bearer wrong-token", nil)
+		drain(res)
+		if res.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("failure %d = %d", i, res.StatusCode)
+		}
+	}
+	res := doBearer(t, ts, "GET", "/api/jobs", "Bearer wrong-token", nil)
+	drain(res)
+	if res.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("blocked token attempt = %d; want 429", res.StatusCode)
+	}
+	if ra := res.Header.Get("Retry-After"); ra == "" {
+		t.Error("Retry-After missing on 429")
+	}
+
+	// A blocked IP is rejected before its token is examined: even the
+	// correct token draws the same 429, so brute force gets no oracle for
+	// which guess landed.
+	res = doBearer(t, ts, "GET", "/api/jobs", "Bearer "+testAPIToken, nil)
+	drain(res)
+	if res.StatusCode != http.StatusTooManyRequests {
+		t.Errorf("valid token while blocked = %d; want 429", res.StatusCode)
+	}
+
+	// The token failures share the login budget for this IP.
+	res = e.do("POST", "/api/login", map[string]string{"password": testPassword})
+	drain(res)
+	if res.StatusCode != http.StatusTooManyRequests {
+		t.Errorf("login after token failures = %d; want 429", res.StatusCode)
+	}
+
+	// Once the window passes, both credentials work again.
+	e.clk.Advance(time.Minute + time.Second)
+	res = doBearer(t, ts, "GET", "/api/jobs", "Bearer "+testAPIToken, nil)
+	drain(res)
+	if res.StatusCode != http.StatusOK {
+		t.Errorf("token after window = %d", res.StatusCode)
+	}
+	res = e.do("POST", "/api/login", map[string]string{"password": testPassword})
+	drain(res)
+	if res.StatusCode != http.StatusOK {
+		t.Errorf("login after window = %d", res.StatusCode)
+	}
+}
+
+// Nine simultaneous wrong-token guesses against the five-failure limit: the
+// check, verification, and recording are one atomic limiter operation, so
+// exactly five draw a 401 and the other four are throttled, however the
+// requests interleave — none slip past the limit between the check and the
+// record.
+func TestHTTPBearerConcurrentAttempts(t *testing.T) {
+	e := newHTTPEnv(t, nil, nil)
+	ts := e.tokenServer(testAPIToken)
+
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	unauthorized, throttled := 0, 0
+	for i := 0; i < 9; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			req, err := http.NewRequest("GET", ts.URL+"/api/jobs", nil)
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			req.Header.Set("Authorization", "Bearer wrong-token")
+			res, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			drain(res)
+			mu.Lock()
+			defer mu.Unlock()
+			switch res.StatusCode {
+			case http.StatusUnauthorized:
+				unauthorized++
+			case http.StatusTooManyRequests:
+				throttled++
+			default:
+				t.Errorf("concurrent token attempt = %d", res.StatusCode)
+			}
+		}()
+	}
+	wg.Wait()
+	if unauthorized != 5 || throttled != 4 {
+		t.Errorf("concurrent guesses: %d unauthorized and %d throttled; want 5 and 4", unauthorized, throttled)
+	}
+}
+
+// A polling client must never be throttled: valid bearer requests leave the
+// limiter untouched, so they neither block nor consume the login budget.
+func TestHTTPBearerNotThrottledWhenValid(t *testing.T) {
+	e := newHTTPEnv(t, nil, nil)
+	ts := e.tokenServer(testAPIToken)
+
+	for i := 0; i < 35; i++ { // beyond the 30-attempt login cap
+		res := doBearer(t, ts, "GET", "/api/jobs", "Bearer "+testAPIToken, nil)
+		drain(res)
+		if res.StatusCode != http.StatusOK {
+			t.Fatalf("poll %d = %d", i, res.StatusCode)
+		}
+	}
+	res := e.do("POST", "/api/login", map[string]string{"password": testPassword})
+	drain(res)
+	if res.StatusCode != http.StatusOK {
+		t.Errorf("login after token burst = %d", res.StatusCode)
+	}
+}
+
+func TestHTTPBearerDisabledWithoutToken(t *testing.T) {
+	e := newHTTPEnv(t, nil, nil) // no API token configured
+
+	// Without API_TOKEN every bearer attempt is a plain 401 — even the
+	// value another deployment might run with.
+	res := e.bare("GET", "/api/jobs", map[string]string{"Authorization": "Bearer " + testAPIToken})
+	drain(res)
+	if res.StatusCode != http.StatusUnauthorized {
+		t.Errorf("bearer while disabled = %d", res.StatusCode)
+	}
+
+	// The session flow is unchanged.
+	e.login()
+	res = e.do("GET", "/api/jobs", nil)
+	drain(res)
+	if res.StatusCode != http.StatusOK {
+		t.Errorf("session list while disabled = %d", res.StatusCode)
+	}
+}
+
+func TestHTTPBearerSchemeParsing(t *testing.T) {
+	e := newHTTPEnv(t, nil, nil)
+	ts := e.tokenServer(testAPIToken)
+
+	// The scheme is case-insensitive (RFC 6750).
+	res := doBearer(t, ts, "GET", "/api/jobs", "bearer "+testAPIToken, nil)
+	drain(res)
+	if res.StatusCode != http.StatusOK {
+		t.Errorf("lowercase scheme = %d", res.StatusCode)
+	}
+
+	// Another scheme is not a token attempt: without a session it is the
+	// usual cookie 401…
+	res = doBearer(t, ts, "GET", "/api/jobs", "Basic dXNlcjpwYXNz", nil)
+	var out map[string]string
+	decodeJSON(t, res, &out)
+	if res.StatusCode != http.StatusUnauthorized || out["error"] != ErrAuth.Error() {
+		t.Errorf("basic scheme, no session = %d %v", res.StatusCode, out)
+	}
+	// …and with a valid session the request goes through despite the
+	// stray Authorization header. The test servers share the 127.0.0.1
+	// cookie domain, so e.client's session cookie rides along.
+	e.login()
+	req, _ := http.NewRequest("GET", ts.URL+"/api/jobs", nil)
+	req.Header.Set("Authorization", "Basic dXNlcjpwYXNz")
+	res2, err := e.client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	drain(res2)
+	if res2.StatusCode != http.StatusOK {
+		t.Errorf("session with basic header = %d", res2.StatusCode)
+	}
+
+	// A Bearer challenge with no token still claims the token path: it is a
+	// 401 whether or not a session cookie rides along, never a silent
+	// fallback to cookie auth. Without a cookie the old code merely drew the
+	// session 401; with one (e.client here) the fallback surfaced as a 200.
+	res = doBearer(t, ts, "GET", "/api/jobs", "Bearer", nil)
+	var noTok map[string]string
+	decodeJSON(t, res, &noTok)
+	if res.StatusCode != http.StatusUnauthorized || noTok["error"] != "Invalid API token." {
+		t.Errorf("bare Bearer without session = %d %v", res.StatusCode, noTok)
+	}
+	req, _ = http.NewRequest("GET", ts.URL+"/api/jobs", nil)
+	req.Header.Set("Authorization", "Bearer")
+	bare, err := e.client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var bareOut map[string]string
+	decodeJSON(t, bare, &bareOut)
+	if bare.StatusCode != http.StatusUnauthorized || bareOut["error"] != "Invalid API token." {
+		t.Errorf("bare Bearer with session = %d %v", bare.StatusCode, bareOut)
+	}
+
+	// "Bearer " with an empty token is the same malformed challenge.
+	req, _ = http.NewRequest("GET", ts.URL+"/api/jobs", nil)
+	req.Header.Set("Authorization", "Bearer ")
+	empty, err := e.client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	drain(empty)
+	if empty.StatusCode != http.StatusUnauthorized {
+		t.Errorf("empty Bearer with session = %d", empty.StatusCode)
 	}
 }
 
@@ -654,7 +1056,7 @@ func TestHTTPRestartWithNewPasswordRevokesSessions(t *testing.T) {
 
 	// A restart under a changed password: a fresh Auth and SessionStore over
 	// the same data directory. Loading drops the stored sessions.
-	newAuth := NewAuth("fresh-secret")
+	newAuth := NewAuth("fresh-secret", "")
 	newSessions := NewSessionStore(filepath.Join(e.dir, "sessions.json"), newAuth.Fingerprint(), e.clk.Now)
 	if err := newSessions.Load(); err != nil {
 		t.Fatal(err)

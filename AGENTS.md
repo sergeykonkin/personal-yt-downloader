@@ -25,11 +25,12 @@ document holds everything an agent needs to work on the repo.
 
 ## Configuration
 
-The app reads exactly **one** environment variable:
+The app reads the following environment variables:
 
 | Variable | Where | Meaning |
 | --- | --- | --- |
 | `PASSWORD` | app, required | The single login password, 1–1024 characters. `make run-dev` passes `local` unless `PASSWORD` is set in the environment; a real deployment should use a strong one. Hashed (Argon2id) once at boot; never written to disk. Changing it and restarting revokes every stored session. |
+| `API_TOKEN` | app, optional | When set to a non-empty value (≤1024 characters, surrounding whitespace trimmed at boot), enables `Authorization: Bearer <token>` authentication for direct API requests (curl, iOS Shortcuts) against the `/api/jobs*` endpoints. Unset or blank disables bearer auth entirely; changing it takes effect on restart. Held in memory as a SHA-256 digest, compared in constant time, never written to disk or logs. Use a long random string — the token carries full API power (submit, delete, share links). |
 
 Everything else on the binary is a flag, not an env var: `-data` (default
 `/data` — what the dev container uses, with `./data` bind-mounted over
@@ -47,6 +48,25 @@ kind — the password comes from the environment, full stop.
 ## Auth model
 
 - One password, from `PASSWORD`, Argon2id-hashed at boot in memory.
+- Bearer auth for direct API requests: setting `API_TOKEN` lets a client
+  authenticate any `/api/jobs*` route with `Authorization: Bearer <token>`
+  instead of a session — full API parity (list, submit, retry, delete,
+  download, share links). The `/api/session` and `/api/logout` routes stay
+  cookie-only; they are meaningless for a token client. Bearer requests
+  skip CSRF and Origin checks (nothing cookie-shaped is involved, and a
+  cross-site page cannot attach an Authorization header); the token is
+  verified in constant time against a SHA-256 digest. A request carrying a
+  Bearer header never falls back to cookie auth — a bad or malformed token
+  (even a Bearer scheme with no token at all) is a 401 even alongside a
+  valid session. Token attempts share the login limiter's per-IP budget
+  (5 failures per 15 minutes block), adjudicated atomically — block check,
+  credential comparison, and failure recording under one lock — so
+  concurrent guesses cannot slip past the failure limit, and a blocked IP
+  is rejected before its token is even examined: wrong and correct guesses
+  look identical, so brute force gets no oracle for which guess landed.
+  Successful attempts never touch the limiter, so a polling client never
+  burns the budget. The token grants full API power — treat it like the
+  password.
 - Sessions: 30-day TTL, cap 20, persisted as token hashes in
   `sessions.json` alongside a fingerprint of the boot password
   (deterministic Argon2id over a fixed salt — stable across restarts under
@@ -106,9 +126,10 @@ host; override the pins with
   build runs no tests; `make test` is the only place they run.
 - `make run-dev` = `docker-build` (tag `personal-yt-downloader`), then one
   `docker run --rm`: port `8080` published, `PASSWORD=local` unless
-  overridden via the environment, `./data` bind-mounted at `/data`,
-  `-insecure-cookies` for plain HTTP; Ctrl-C stops it. Deploying for real
-  — fronting proxy, tunnel — is handled outside the repo.
+  overridden via the environment, `API_TOKEN` passed through from the
+  environment (empty means bearer auth stays off), `./data` bind-mounted at
+  `/data`, `-insecure-cookies` for plain HTTP; Ctrl-C stops it. Deploying
+  for real — fronting proxy, tunnel — is handled outside the repo.
 
 ## Frontend notes (iOS Safari realities)
 
@@ -135,7 +156,13 @@ host; override the pins with
 ## Security posture
 
 - Argon2id password hashing (in memory only); sessions and share links
-  stored as hashes, never plaintext tokens.
+  stored as hashes, never plaintext tokens. The optional `API_TOKEN` is
+  likewise held as a SHA-256 digest and compared in constant time; login
+  and bearer attempts are adjudicated by the shared per-IP limiter in one
+  atomic step — check, verify, record under a single lock, so concurrent
+  guesses cannot slip past the failure limit — and a blocked IP is turned
+  away before its token is even examined, while valid token attempts
+  leave the limiter untouched.
 - CSRF tokens + `Origin` checks + `SameSite=Strict`; hardened response
   headers (`nosniff`, `no-referrer`, `DENY`, `no-store` off `/assets/`).
 - The server listens on `:8080` (all interfaces — for local dev that means

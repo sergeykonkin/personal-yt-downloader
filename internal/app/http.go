@@ -55,13 +55,13 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/login", s.handleLogin)
 	mux.HandleFunc("GET /api/session", s.requireSession(s.handleSession))
 	mux.HandleFunc("POST /api/logout", s.requireSession(s.handleLogout))
-	mux.HandleFunc("GET /api/jobs", s.requireSession(s.handleListJobs))
-	mux.HandleFunc("POST /api/jobs", s.requireSession(s.handleCreateJob))
-	mux.HandleFunc("GET /api/jobs/{id}", s.requireSession(s.handleGetJob))
-	mux.HandleFunc("POST /api/jobs/{id}/retry", s.requireSession(s.handleRetryJob))
-	mux.HandleFunc("DELETE /api/jobs/{id}", s.requireSession(s.handleDeleteJob))
-	mux.HandleFunc("GET /api/jobs/{id}/download", s.requireSession(s.handleDownload))
-	mux.HandleFunc("POST /api/jobs/{id}/link", s.requireSession(s.handleShareLink))
+	mux.HandleFunc("GET /api/jobs", s.requireAuth(s.handleListJobs))
+	mux.HandleFunc("POST /api/jobs", s.requireAuth(s.handleCreateJob))
+	mux.HandleFunc("GET /api/jobs/{id}", s.requireAuth(s.handleGetJob))
+	mux.HandleFunc("POST /api/jobs/{id}/retry", s.requireAuth(s.handleRetryJob))
+	mux.HandleFunc("DELETE /api/jobs/{id}", s.requireAuth(s.handleDeleteJob))
+	mux.HandleFunc("GET /api/jobs/{id}/download", s.requireAuth(s.handleDownload))
+	mux.HandleFunc("POST /api/jobs/{id}/link", s.requireAuth(s.handleShareLink))
 	// The optional segment after the token is the real filename: clients
 	// that save from a URL (VLC, the iOS Files app) name the file after the
 	// last path segment, so the issued URL ends in the video's title. The
@@ -200,13 +200,20 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ip := s.clientIP(r)
-	if allowed, wait := s.limiter.Allowed(ip); !allowed {
-		w.Header().Set("Retry-After", strconv.Itoa(int(wait.Seconds())+1))
-		apiError(w, http.StatusTooManyRequests, "Too many attempts. Try again later.")
+	// One atomic limiter operation: the block check, the password
+	// comparison, and the failure recording cannot be interleaved by
+	// concurrent requests. Verification runs under the limiter's lock —
+	// the Argon2id comparison is slow, but it also bounds concurrent
+	// verifications to one. Successful logins still count toward the
+	// attempt cap: minting sessions must cost budget.
+	allowed, verified, wait := s.limiter.Attempt(ip, func() bool {
+		return s.auth.Verify(input.Password)
+	}, true)
+	if !allowed {
+		tooManyAttempts(w, wait)
 		return
 	}
-	if !s.auth.Verify(input.Password) {
-		s.limiter.RecordBad(ip)
+	if !verified {
 		apiError(w, http.StatusUnauthorized, "Incorrect password.")
 		return
 	}
@@ -264,8 +271,7 @@ type sessionKey struct{}
 // token on state-changing methods.
 func (s *Server) requireSession(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if strings.Contains(r.URL.Path, "//") {
-			apiError(w, http.StatusNotFound, "Route not found.")
+		if rejectOpaquePath(w, r) {
 			return
 		}
 		cookie, err := r.Cookie(sessionCookie)
@@ -292,6 +298,75 @@ func (s *Server) requireSession(next http.HandlerFunc) http.HandlerFunc {
 
 func contextWithSession(r *http.Request, sess Session) context.Context {
 	return context.WithValue(r.Context(), sessionKey{}, sess)
+}
+
+// rejectOpaquePath turns away paths containing "//": an empty segment makes
+// the mux's pattern matching behave differently from a cleaned path, so
+// authenticated routes decline the ambiguity up front.
+func rejectOpaquePath(w http.ResponseWriter, r *http.Request) bool {
+	if strings.Contains(r.URL.Path, "//") {
+		apiError(w, http.StatusNotFound, "Route not found.")
+		return true
+	}
+	return false
+}
+
+// bearerToken extracts the token from an "Authorization: Bearer <token>"
+// header. It reports a Bearer challenge whenever the scheme names Bearer —
+// including the malformed no-token form, which must draw a 401 rather than
+// silently falling back to session auth. Absent headers and other schemes
+// report false; those requests fall through to session auth.
+func bearerToken(r *http.Request) (string, bool) {
+	scheme, rest, _ := strings.Cut(r.Header.Get("Authorization"), " ")
+	if !strings.EqualFold(scheme, "Bearer") {
+		return "", false
+	}
+	return strings.TrimSpace(rest), true
+}
+
+// tooManyAttempts writes the 429 shared by every throttled auth attempt.
+func tooManyAttempts(w http.ResponseWriter, wait time.Duration) {
+	w.Header().Set("Retry-After", strconv.Itoa(int(wait.Seconds())+1))
+	apiError(w, http.StatusTooManyRequests, "Too many attempts. Try again later.")
+}
+
+// requireAuth guards the API routes, accepting either a Bearer token (the
+// API_TOKEN credential for direct API requests) or a session cookie. A
+// request carrying an Authorization: Bearer header is authorized by that
+// token alone: no CSRF token or Origin check applies, since nothing
+// cookie-shaped is involved and a cross-site page cannot attach the
+// header — and a failed or malformed token is a 401 even alongside a valid
+// session, so the header never silently degrades into cookie auth. Token
+// attempts share the login limiter's per-IP budget with one difference
+// from logins: successful attempts record nothing at all, so a polling
+// client never burns the budget. The limiter adjudicates each attempt
+// atomically — block check, token comparison, failure recording under one
+// lock — so concurrent guesses cannot slip past the failure limit, and a
+// blocked IP is turned away before its token is examined, drawing the
+// same 429 for a wrong and a right guess.
+func (s *Server) requireAuth(next http.HandlerFunc) http.HandlerFunc {
+	sessionFlow := s.requireSession(next)
+	return func(w http.ResponseWriter, r *http.Request) {
+		if token, ok := bearerToken(r); ok {
+			if rejectOpaquePath(w, r) {
+				return
+			}
+			allowed, verified, wait := s.limiter.Attempt(s.clientIP(r), func() bool {
+				return s.auth.VerifyAPIToken(token)
+			}, false)
+			if !allowed {
+				tooManyAttempts(w, wait)
+				return
+			}
+			if !verified {
+				apiError(w, http.StatusUnauthorized, "Invalid API token.")
+				return
+			}
+			next(w, r)
+			return
+		}
+		sessionFlow(w, r)
+	}
 }
 
 // ---- jobs ----

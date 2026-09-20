@@ -115,28 +115,42 @@ func fingerprintPassword(password string) string {
 	return hashToken(string(key))
 }
 
-// Auth verifies the single login password. The password is configured
-// exclusively through the PASSWORD environment variable: it is hashed
-// once at boot and never written to disk.
+// Auth verifies the two boot-configured credentials: the login password
+// (PASSWORD) and the optional API token (API_TOKEN) that Bearer-authenticates
+// direct API requests. Neither is ever written to disk.
 type Auth struct {
-	hash string
-	fp   string // stable fingerprint of the password for session bookkeeping
+	hash         string
+	fp           string // stable fingerprint of the password for session bookkeeping
+	apiTokenHash string // SHA-256 of API_TOKEN; empty when bearer auth is off
 }
 
-// NewAuth derives the stored hash for the boot-time password. An empty
-// password is a deployment error; serve refuses to start, so a running
-// server always holds a usable Auth.
-func NewAuth(password string) *Auth {
+// NewAuth derives the stored hash for the boot-time password and, when
+// apiToken is non-empty, the digest the bearer token is checked against. An
+// empty password is a deployment error; serve refuses to start, so a running
+// server always holds a usable Auth. An empty apiToken leaves bearer auth
+// disabled.
+func NewAuth(password, apiToken string) *Auth {
 	encoded, err := hashPassword(password)
 	if err != nil {
 		panic(err) // crypto/rand failure is unrecoverable
 	}
-	return &Auth{hash: encoded, fp: fingerprintPassword(password)}
+	a := &Auth{hash: encoded, fp: fingerprintPassword(password)}
+	if apiToken != "" {
+		a.apiTokenHash = hashToken(apiToken)
+	}
+	return a
 }
 
 // Verify reports whether the password matches the configured one.
 func (a *Auth) Verify(password string) bool {
 	return a.hash != "" && verifyPassword(a.hash, password)
+}
+
+// VerifyAPIToken reports whether the presented bearer token matches the
+// configured one, in constant time. It never succeeds when no API token is
+// configured.
+func (a *Auth) VerifyAPIToken(token string) bool {
+	return a.apiTokenHash != "" && subtle.ConstantTimeCompare([]byte(hashToken(token)), []byte(a.apiTokenHash)) == 1
 }
 
 // Fingerprint identifies the configured password without revealing it.
@@ -337,28 +351,45 @@ func NewRateLimiter(window time.Duration, maxFailures, maxAttempts int, now func
 	return &RateLimiter{now: now, window: window, maxFailures: maxFailures, maxAttempts: maxAttempts, attempts: map[string][]rateAttempt{}}
 }
 
-// Allowed reports whether a login attempt may proceed. When denied it returns
-// how long to wait.
-func (r *RateLimiter) Allowed(key string) (bool, time.Duration) {
+// Attempt adjudicates one credential attempt for the key atomically: the
+// block check, the credential verification, and the failure recording all
+// happen under a single lock, so concurrent requests cannot slip past the
+// limits between the check and the record. verify examines the credential;
+// it runs while the limiter is locked and must not call back into the
+// limiter. A blocked key is denied without invoking verify — wrong and
+// correct credentials stay indistinguishable, so brute force gets no oracle
+// for which guess landed. countSuccess makes a successful attempt count
+// toward the total-attempt cap (login, where minting a session must cost
+// budget); without it a success records nothing at all, so a polling bearer
+// client never burns the budget. Failed attempts always record; denied
+// ones record nothing.
+func (r *RateLimiter) Attempt(key string, verify func() bool, countSuccess bool) (allowed, verified bool, wait time.Duration) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	now := r.now()
-	r.recordLocked(key, now, false)
-	return r.checkLocked(key, now)
-}
-
-// RecordBad marks a failed login attempt.
-func (r *RateLimiter) RecordBad(key string) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	now := r.now()
+	r.pruneKeyLocked(key, now)
+	allowed, wait = r.checkLocked(key, now)
+	if !allowed {
+		return false, false, wait
+	}
+	if verify() {
+		if countSuccess {
+			r.recordLocked(key, now, false)
+		}
+		return true, true, 0
+	}
 	r.recordLocked(key, now, true)
+	return true, false, 0
 }
 
 func (r *RateLimiter) recordLocked(key string, now time.Time, bad bool) {
+	r.attempts[key] = append(r.attempts[key], rateAttempt{at: now, bad: bad})
+	r.pruneKeyLocked(key, now)
+}
+
+// pruneKeyLocked drops the key's attempts from outside the current window.
+func (r *RateLimiter) pruneKeyLocked(key string, now time.Time) {
 	list := r.attempts[key]
-	list = append(list, rateAttempt{at: now, bad: bad})
-	// Keep only the current window's attempts.
 	kept := list[:0]
 	for _, a := range list {
 		if now.Sub(a.at) < r.window {

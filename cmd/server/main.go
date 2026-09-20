@@ -14,6 +14,7 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"personal-yt-downloader/internal/app"
 )
@@ -31,7 +32,9 @@ Flags for server:
                          trusted for rate limiting
                          (default "127.0.0.0/8,::1/128"; empty trusts none)
 
-The login password comes from the PASSWORD environment variable.
+The login password comes from the PASSWORD environment variable. Setting
+API_TOKEN (optional) additionally enables "Authorization: Bearer <token>"
+authentication for direct API requests; unset or empty disables it.
 `)
 }
 
@@ -65,8 +68,9 @@ func healthcheck() error {
 	return nil
 }
 
-// serve reads exactly one environment variable — the login password — and
-// takes everything else as explicit flags.
+// serve reads two environment variables — the login password and the
+// optional API token for Bearer authentication — and takes everything else
+// as explicit flags.
 func serve(args []string) error {
 	fs := flag.NewFlagSet("server", flag.ContinueOnError)
 	dataDir := fs.String("data", "/data", "data directory")
@@ -89,8 +93,15 @@ func serve(args []string) error {
 	if password == "" {
 		return errors.New("PASSWORD must be set to a non-empty password.")
 	}
-	if len(password) > 1024 {
+	if utf8.RuneCountInString(password) > 1024 {
 		return errors.New("PASSWORD is too long (over 1024 characters).")
+	}
+	// Trimmed to match what a client can present: the token pulled out of
+	// an Authorization header never carries surrounding whitespace, so a
+	// padded env var would otherwise be an unusable token.
+	apiToken := strings.TrimSpace(os.Getenv("API_TOKEN"))
+	if utf8.RuneCountInString(apiToken) > 1024 {
+		return errors.New("API_TOKEN is too long (over 1024 characters).")
 	}
 
 	runner := app.ProcessRunner{}
@@ -107,7 +118,10 @@ func serve(args []string) error {
 		return errors.New("Unable to read the stored jobs: " + err.Error())
 	}
 
-	auth := app.NewAuth(password)
+	auth := app.NewAuth(password, apiToken)
+	if apiToken != "" {
+		slog.Info("Bearer token authentication enabled for API requests")
+	}
 	sessions := app.NewSessionStore(filepath.Join(root, "sessions.json"), auth.Fingerprint(), nil)
 	if err := sessions.Load(); err != nil {
 		slog.Error("Sessions could not be loaded; all sessions were dropped", "error", err.Error())
